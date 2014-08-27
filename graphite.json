@@ -1,0 +1,590 @@
+
+{
+  "AWSTemplateFormatVersion" : "2010-09-09",
+
+  "Description" : "Launches a Graphite stack",
+
+  "Parameters" : {
+    "InstanceType" : {
+      "Description" : "EC2 instance type",
+      "Type" : "String",
+      "Default" : "m1.small",
+      "AllowedValues" : ["m1.small","m1.medium","m1.large","m1.xlarge","m3.medium","m3.large","m3.xlarge","m3.2xlarge","c1.medium","c1.xlarge","c3.large","c3.xlarge","c3.2xlarge","c3.4xlarge","c3.8xlarge","cc2.8xlarge","m2.xlarge","m2.2xlarge","m2.4xlarge","r3.large","r3.xlarge","r3.2xlarge","r3.4xlarge","r3.8xlarge","cr1.8xlarge","hi1.4xlarge","hs1.8xlarge","i2.xlarge","i2.2xlarge","i2.4xlarge","i2.8xlarge","t1.micro","cg1.4xlarge","g2.2xlarge"],
+      "ConstraintDescription" : "must be a valid EC2 instance type."
+    },
+    "KeyName" : {
+      "Description" : "Name of an existing EC2 KeyPair to enable SSH access to the instances",
+      "Type" : "String"
+    },
+    "GraphiteTimeZone" : {
+      "Description" : "Your local time zone (used for graph rendering, not for metrics storage)",
+      "Type" : "String",
+      "Default" : "America/Los_Angeles"
+    },
+    "GraphiteUsername" : {
+      "Description" : "Graphite superuser username",
+      "Type" : "String",
+      "Default" : "graphite"
+    },
+    "GraphitePassword" : {
+      "Description" : "Graphite superuser password",
+      "Type" : "String",
+      "Default" : "graphite"
+    },
+    "GraphiteEmail" : {
+      "Description" : "Graphite superuser email",
+      "Type" : "String"
+    },
+    "GraphiteSecretKey" : {
+      "Description" : "String for Graphite to use when salting hashes. Make it long and unique. Changing it later will probably break login.",
+      "Type" : "String",
+      "Default" : "some_very_salty_salt"
+    },
+    "GraphiteEbsSnapshot" : {
+      "Description" : "Latest EBS snapshot of Graphite data volume (e.g., 'snap-1234567b')",
+      "Type" : "String"
+    },
+    "Subnets" : {
+      "Description" : "List of VPC subnet IDs for the cluster. Note: must match the passed AvailabilityZones.",
+      "Type" : "CommaDelimitedList"
+    },  
+    "VpcId" : {
+      "Description" : "VPC associated with the provided subnets",
+      "Type" : "String"
+    },
+    "AdminSecurityGroup" : {
+      "Description" : "Existing security group that should be granted administrative access (e.g., 'sg-123456')",
+      "Type" : "String"
+    },
+    "AvailabilityZones": {
+      "Description" : "(Optional) If passed, only launch nodes in these AZs (e.g., 'us-east-1a,us-east-1b'). Note: these must match the passed Subnets.",
+      "Type" : "CommaDelimitedList",
+      "Default" : ""
+    }
+  },
+
+  "Conditions" : {
+    "UseAllAvailabilityZones" : {"Fn::Equals" : [{ "Fn::Join" : ["", {"Ref" : "AvailabilityZones"} ]}, ""]}
+  },
+
+  "Mappings" : {
+    "RegionMap" : {
+      "us-east-1" : {
+        "AMI" : "ami-6692700e"
+      },
+      "us-west-1" : {
+        "AMI" : "ami-d690ab93"
+      },
+      "us-west-2" : {
+        "AMI" : "ami-9fa0d9af"
+      },
+      "eu-west-1" : {
+        "AMI" : "ami-db7eb8ac"
+      },
+      "ap-southeast-1" : {
+        "AMI" : "ami-7485d726"
+      },
+      "ap-southeast-2" : {
+        "AMI" : "ami-5f45de65"
+      },
+      "ap-northeast-1" : {
+        "AMI" : "ami-f53274f4"
+      },
+      "sa-east-1" : {
+        "AMI" : "ami-b53f92a8"
+      }
+    }
+  },
+
+  "Resources" : {
+
+    "IAMUser" : {
+      "Type" : "AWS::IAM::User",
+      "Properties" : {
+        "Policies" : [{
+          "PolicyName" : "IAMAccess",
+          "PolicyDocument" : {
+            "Statement" : [{
+              "Effect"    : "Allow",
+              "NotAction" : "iam:*",
+              "Resource"  : "*"
+            }]
+          }
+        }]
+      }
+    },
+
+    "HostKeys" : {
+      "Type" : "AWS::IAM::AccessKey",
+      "Properties" : {
+        "UserName" : { "Ref" : "IAMUser" }
+      }
+    },
+
+    "ServerGroup" : {
+      "Type" : "AWS::AutoScaling::AutoScalingGroup",
+      "Properties" : {
+        "AvailabilityZones" : {
+          "Fn::If" : [
+            "UseAllAvailabilityZones",
+            { "Fn::GetAZs": "" },
+            {"Ref" : "AvailabilityZones"}
+          ]
+        },
+        "LaunchConfigurationName" : { "Ref" : "LaunchConfig" },
+        "MinSize" : 1,
+        "MaxSize" : 1,
+        "DesiredCapacity" : 1,
+        "LoadBalancerNames" : [ { "Ref" : "PublicElb" }, { "Ref" : "PrivateElb" } ],
+        "VPCZoneIdentifier" : { "Ref" : "Subnets" }
+      }
+    },
+
+    "LaunchConfig" : {
+      "Type" : "AWS::AutoScaling::LaunchConfiguration",
+      "Metadata" : {
+        "AWS::CloudFormation::Init" : {
+          "config": {
+
+            "packages" : {
+              "python": {
+                "boto": []
+              },
+              "apt" : {
+                "graphite-web" : [],
+                "graphite-carbon" : [],
+                "apache2" : [],
+                "libapache2-mod-wsgi" : [],
+                "expect": []
+              }
+            },
+
+            "files" : {
+
+              "/etc/graphite/local_settings.py" : {
+                "content" : { "Fn::Join" : ["\n", [
+                  "LOG_RENDERING_PERFORMANCE = True",
+                  "LOG_CACHE_PERFORMANCE = True",
+                  "LOG_METRIC_ACCESS = True",
+                  "GRAPHITE_ROOT = '/usr/share/graphite-web'",
+                  "CONF_DIR = '/etc/graphite'",
+                  "STORAGE_DIR = '/var/lib/graphite/whisper'",
+                  "CONTENT_DIR = '/usr/share/graphite-web/static'",
+                  "WHISPER_DIR = '/var/lib/graphite/whisper'",
+                  "LOG_DIR = '/var/log/graphite'",
+                  "INDEX_FILE = '/var/lib/graphite/search_index'  # Search index file",
+                  "DATABASES = {",
+                  "    'default': {",
+                  "        'NAME': '/var/lib/graphite/graphite.db',",
+                  "        'ENGINE': 'django.db.backends.sqlite3',",
+                  "        'USER': '',",
+                  "        'PASSWORD': '',",
+                  "        'HOST': '',",
+                  "        'PORT': ''",
+                  "    }",
+                  "}",
+                  "USE_REMOTE_USER_AUTHENTICATION = True",
+                  "TIME_ZONE = '{{ time_zone }}'",
+                  "SECRET_KEY = '{{ secret_key }}'",
+                  ""
+                ]]},
+                "context" : {
+                  "time_zone": { "Ref" : "GraphiteTimeZone" },
+                  "secret_key": { "Ref" : "GraphiteSecretKey" }
+                },
+                "mode"    : "000644",
+                "owner"   : "root",
+                "group"   : "root"
+              },
+
+              "/etc/default/graphite-carbon" : {
+                "content" : { "Fn::Join" : ["\n", [
+                  "CARBON_CACHE_ENABLED=true", ""
+                ]]},
+                "mode"    : "000644",
+                "owner"   : "root",
+                "group"   : "root"
+              },
+
+              "/etc/carbon/storage-schemas.conf" : {
+                "content" : { "Fn::Join" : ["\n", [
+                  "[carbon]",
+                  "pattern = ^carbon\\.",
+                  "retentions = 60:90d",
+                  "",
+                  "[default]",
+                  "pattern = .*",
+                  "retentions = 60s:1d,5m:1w,15m:1y,1h:10y",
+                  ""
+                ]]},
+                "mode"    : "000644",
+                "owner"   : "root",
+                "group"   : "root"
+              },
+
+              "/etc/carbon/carbon.conf": {
+                "content" : { "Fn::Join" : ["\n", [
+                  "[cache]",
+                  "STORAGE_DIR    = /var/lib/graphite/",
+                  "CONF_DIR       = /etc/carbon/",
+                  "LOG_DIR        = /var/log/carbon/",
+                  "PID_DIR        = /var/run/",
+                  "LOCAL_DATA_DIR = /var/lib/graphite/whisper/",
+                  "ENABLE_LOGROTATION = True",
+                  "USER = _graphite",
+                  "MAX_CACHE_SIZE = inf",
+                  "MAX_UPDATES_PER_SECOND = 500",
+                  "MAX_CREATES_PER_MINUTE = 50",
+                  "LINE_RECEIVER_INTERFACE = 0.0.0.0",
+                  "LINE_RECEIVER_PORT = 2003",
+                  "ENABLE_UDP_LISTENER = False",
+                  "UDP_RECEIVER_INTERFACE = 0.0.0.0",
+                  "UDP_RECEIVER_PORT = 2003",
+                  "PICKLE_RECEIVER_INTERFACE = 0.0.0.0",
+                  "PICKLE_RECEIVER_PORT = 2004",
+                  "LOG_LISTENER_CONNECTIONS = True",
+                  "USE_INSECURE_UNPICKLER = False",
+                  "CACHE_QUERY_INTERFACE = 0.0.0.0",
+                  "CACHE_QUERY_PORT = 7002",
+                  "USE_FLOW_CONTROL = True",
+                  "LOG_UPDATES = False",
+                  "LOG_CACHE_HITS = False",
+                  "LOG_CACHE_QUEUE_SORTS = True",
+                  "CACHE_WRITE_STRATEGY = sorted",
+                  "WHISPER_AUTOFLUSH = False",
+                  "WHISPER_FALLOCATE_CREATE = True",
+                  "",
+                  "[relay]",
+                  "LINE_RECEIVER_INTERFACE = 0.0.0.0",
+                  "LINE_RECEIVER_PORT = 2013",
+                  "PICKLE_RECEIVER_INTERFACE = 0.0.0.0",
+                  "PICKLE_RECEIVER_PORT = 2014",
+                  "LOG_LISTENER_CONNECTIONS = True",
+                  "RELAY_METHOD = rules",
+                  "REPLICATION_FACTOR = 1",
+                  "DESTINATIONS = 127.0.0.1:2004",
+                  "MAX_DATAPOINTS_PER_MESSAGE = 500",
+                  "MAX_QUEUE_SIZE = 10000",
+                  "USE_FLOW_CONTROL = True",
+                  "",
+                  "[aggregator]",
+                  "LINE_RECEIVER_INTERFACE = 0.0.0.0",
+                  "LINE_RECEIVER_PORT = 2023",
+                  "PICKLE_RECEIVER_INTERFACE = 0.0.0.0",
+                  "PICKLE_RECEIVER_PORT = 2024",
+                  "LOG_LISTENER_CONNECTIONS = True",
+                  "FORWARD_ALL = True",
+                  "DESTINATIONS = 127.0.0.1:2004",
+                  "REPLICATION_FACTOR = 1",
+                  "MAX_QUEUE_SIZE = 10000",
+                  "USE_FLOW_CONTROL = True",
+                  "MAX_DATAPOINTS_PER_MESSAGE = 500",
+                  "MAX_AGGREGATION_INTERVALS = 5",
+                  ""
+                ]]},                
+                "mode"    : "000755",
+                "owner"   : "root",
+                "group"   : "root"
+              },
+
+              "/usr/local/bin/manage-snapshots" : {
+                "content" : { "Fn::Join" : ["\n", [
+                  "#!/usr/bin/env python",
+                  "import argparse",
+                  "import boto.cloudformation",
+                  "import boto.ec2",
+                  "",
+                  "",
+                  "class SnapshotManager(object):",
+                  "    STACK_PARAM = 'GraphiteEbsSnapshot'",
+                  "    ",
+                  "    def __init__(self, region, stack, volume, aws_access_key_id=None, aws_secret_access_key=None):",
+                  "        self.region = region",
+                  "        self.stack = stack",
+                  "        self.volume = volume",
+                  "        if aws_access_key_id and aws_secret_access_key:",
+                  "            self.ec2_conn = boto.ec2.connect_to_region(region, aws_access_key_id=aws_access_key_id, aws_secret_access_key=aws_secret_access_key)",
+                  "            self.cfn_conn = boto.cloudformation.connect_to_region(region, aws_access_key_id=aws_access_key_id, aws_secret_access_key=aws_secret_access_key)",
+                  "        else:",
+                  "            self.ec2_conn = boto.ec2.connect_to_region(region)",
+                  "            self.cfn_conn = boto.cloudformation.connect_to_region(region)",
+                  "    ",
+                  "    def create_snapshot(self):",
+                  "        print 'Creating snapshot for volume {volume}'.format(volume=self.volume)",
+                  "        description = 'Created from {volume} for stack {stack}'.format(volume=self.volume, stack=self.stack)",
+                  "        return self.ec2_conn.create_snapshot(self.volume, description)",
+                  "    ",
+                  "    def get_completed_snapshots(self):",
+                  "        return sorted([s for s in self.ec2_conn.get_all_snapshots(filters={'volume-id': self.volume}) if s.status=='completed'], key=lambda s: s.start_time)",
+                  "        ",
+                  "    def update_stack_snapshot(self, snapshot):",
+                  "        print 'Updating {param} on stack {stack} to {snap}'.format(param=self.STACK_PARAM, stack=self.stack, snap=snapshot)",
+                  "        params = [(p.key, p.value) for p in self.cfn_conn.describe_stacks(self.stack)[0].parameters if p.key != self.STACK_PARAM]",
+                  "        params.append((self.STACK_PARAM, snapshot))",
+                  "        template = self.cfn_conn.get_template(self.stack)['GetTemplateResponse']['GetTemplateResult']['TemplateBody']",
+                  "        self.cfn_conn.update_stack(self.stack, template_body=template, parameters=params, capabilities=['CAPABILITY_IAM'])",
+                  "    ",
+                  "    def trim_snapshots(self, keep=5):",
+                  "        for snapshot in self.get_completed_snapshots()[:keep-1]:",
+                  "            print 'Deleting snapshot {snap}'.format(snap=snapshot.id)",
+                  "            self.ec2_conn.delete_snapshot(snapshot.id)",
+                  "",
+                  "",
+                  "def main():",
+                  "    parser = argparse.ArgumentParser()",
+                  "    parser.add_argument('command', metavar='COMMAND', help='command', choices=['create', 'update-stack', 'trim'])",
+                  "    parser.add_argument('-v', dest='volume', help='EBS volume id', required=True)",
+                  "    parser.add_argument('-s', dest='stack', help='CloudFormation stack ID or name', required=True)",
+                  "    parser.add_argument('-r', dest='region', help='AWS Region', required=True)",
+                  "    parser.add_argument('-m', dest='max', help='Max number of snapshots to keep when trimming', default=5, type=int)",
+                  "    parser.add_argument('--key-id', dest='key_id', help='AWS access key id')",
+                  "    parser.add_argument('--secret-key', dest='secret_key', help='AWS secret access key')",
+                  "    args = parser.parse_args()",
+                  "        ",
+                  "    sm = SnapshotManager(args.region, args.stack, args.volume, args.key_id, args.secret_key)",
+                  "    if args.command == 'create':",
+                  "        sm.create_snapshot()",
+                  "    elif args.command == 'update-stack':",
+                  "        snapshots = sm.get_completed_snapshots()",
+                  "        sm.update_stack_snapshot(snapshots[-1].id)",
+                  "    elif args.command == 'trim':",
+                  "        sm.trim_snapshots(args.max)",
+                  "        ",
+                  "",
+                  "if __name__ == '__main__':",
+                  "    main()",
+                  ""
+                ]]},
+                "mode"    : "000755",
+                "owner"   : "root",
+                "group"   : "root"
+              },
+
+              "/usr/local/bin/get-attached-volume" : {
+                "content" : { "Fn::Join" : ["\n", [
+                  "#!/usr/bin/env python",
+                  "import boto.ec2",
+                  "import boto.utils",
+                  "",
+                  "c = boto.ec2.connect_to_region('{{region}}', aws_access_key_id='{{aws_key}}', aws_secret_access_key='{{aws_secret}}')",
+                  "instance_id = boto.utils.get_instance_metadata()['instance-id']",
+                  "volume_id = c.get_all_volumes(filters={'attachment.instance-id': instance_id, 'attachment.device': '{{device}}'})[0].id",
+                  "print volume_id"
+                ]]},
+                "context" : {
+                  "region": { "Ref" : "AWS::Region" },
+                  "aws_key": { "Ref" : "HostKeys" }, 
+                  "aws_secret": { "Fn::GetAtt" : ["HostKeys", "SecretAccessKey"]},
+                  "device": "/dev/xvdf"
+                },
+                "mode"    : "000755",
+                "owner"   : "root",
+                "group"   : "root"
+              },
+
+              "/etc/cron.d/snapshots": {
+                "content" : { "Fn::Join" : ["\n", [
+                  "# Update stack so new instances boot from latest snapshot",
+                  "COMMON_OPTS=\"-s {{stack}} -r {{region}} --key-id {{key}} --secret-key {{secret}}\"",
+                  "23 * * * * root /usr/local/bin/manage-snapshots create -v `/usr/local/bin/get-attached-volume` $COMMON_OPTS",
+                  "28 * * * * root /usr/local/bin/manage-snapshots trim -v `/usr/local/bin/get-attached-volume` -m 5 $COMMON_OPTS",
+                  "* * * * * root /usr/local/bin/manage-snapshots update-stack -v `/usr/local/bin/get-attached-volume` $COMMON_OPTS",
+                  ""
+                ]]},
+                "context" : {
+                  "region": { "Ref" : "AWS::Region" },
+                  "stack": { "Ref" : "AWS::StackName" },
+                  "key": { "Ref" : "HostKeys" }, 
+                  "secret": { "Fn::GetAtt" : ["HostKeys", "SecretAccessKey"]}                  
+                },
+                "mode"    : "000644",
+                "owner"   : "root",
+                "group"   : "root"
+              }
+
+            }
+          }
+        }
+      },
+      "Properties" : {
+        "KeyName" : { "Ref" : "KeyName" },
+        "ImageId" : { "Fn::FindInMap" : [ "RegionMap", { "Ref" : "AWS::Region" }, "AMI"] },
+        "SecurityGroups" : [ { "Ref" : "ServerSecurityGroup" }, { "Ref" : "AdminSecurityGroup" } ],
+        "AssociatePublicIpAddress": "true",
+        "InstanceType" : { "Ref" : "InstanceType" },
+        "BlockDeviceMappings" : [ {
+            "DeviceName" : "/dev/xvdf",
+            "Ebs" : {
+              "DeleteOnTermination" : true,
+              "SnapshotId" : { "Ref" : "GraphiteEbsSnapshot" },
+              "VolumeType" : "gp2"
+            }
+        }],
+        "UserData" : { "Fn::Base64" : { "Fn::Join" : ["", [
+          "#!/bin/bash -ex\n",
+
+          "# Helper function\n",
+          "function error_exit\n",
+          "{\n",
+          "  cfn-signal -e 1 -r \"$1\" '", { "Ref" : "WaitHandle" }, "'\n",
+          "  exit 1\n",
+          "}\n",
+
+          "# Mount volume created from latest graphite snapshot\n",
+          "mkdir -p /var/lib/graphite\n",
+          "mount /dev/xvdf /var/lib/graphite\n",
+
+          "apt-get update\n",
+
+          "cfn-init -s ", { "Ref" : "AWS::StackName" }, " -r LaunchConfig ",
+          "    --access-key ",  { "Ref" : "HostKeys" },
+          "    --secret-key ", { "Fn::GetAtt": ["HostKeys", "SecretAccessKey"] },
+          "    --region ", { "Ref" : "AWS::Region" }, " || error_exit 'Failed to run cfn-init'\n",
+
+          "graphite-manage syncdb --noinput\n",
+          "chown _graphite:_graphite /var/lib/graphite/graphite.db\n",
+
+          "# Set admin password\n",
+          "USERNAME=", { "Ref" : "GraphiteUsername" }, "\n",
+          "PASSWORD=", { "Ref" : "GraphitePassword" }, "\n",
+          "EMAIL=", { "Ref" : "GraphiteEmail" }, "\n",
+          "# Ignore errors on create since user might already exist\n",
+          "graphite-manage createsuperuser --username=\"${USERNAME}\" --email=\"${EMAIL}\" --noinput || true\n",
+          "expect << DONE\n",
+          "  spawn graphite-manage changepassword \"${USERNAME}\"\n",
+          "  expect \"Password: \"\n",
+          "  send -- \"${PASSWORD}\\r\"\n",
+          "  expect \"Password (again): \"\n",
+          "  send -- \"${PASSWORD}\\r\"\n",
+          "  expect eof\n",
+          "DONE\n",
+
+          "a2dissite 000-default\n",
+          "cp /usr/share/graphite-web/apache2-graphite.conf /etc/apache2/sites-available\n",
+          "a2ensite apache2-graphite\n",
+
+          "service carbon-cache start\n",
+          "service apache2 reload\n",
+          
+          "# All is well so signal success\n",
+          "cfn-signal -e 0 -r \"Stack setup complete\" '", { "Ref" : "WaitHandle" }, "'\n",
+
+          "#EOF"
+        ]]}}
+      }
+    },
+
+    "PublicLbSecurityGroup" : {
+      "Type" : "AWS::EC2::SecurityGroup",
+      "Properties" : {
+        "GroupDescription" : "Allow access to Graphite",
+        "VpcId" : { "Ref" : "VpcId" },
+        "SecurityGroupIngress" : []
+      }
+    },
+
+    "PrivateLbSecurityGroup" : {
+      "Type" : "AWS::EC2::SecurityGroup",
+      "Properties" : {
+        "GroupDescription" : "Allow access to Graphite",
+        "VpcId" : { "Ref" : "VpcId" },
+        "SecurityGroupIngress" : [
+          { "IpProtocol" : "tcp", "FromPort" : "2003", "ToPort" : "2003", "SourceSecurityGroupId" : { "Ref" : "ClientSecurityGroup"} }
+        ]
+      }
+    },
+
+    "ClientSecurityGroup" : {
+      "Type" : "AWS::EC2::SecurityGroup",
+      "Properties" : {
+        "GroupDescription" : "For Graphite clients. Grants access to carbon.",
+        "VpcId" : { "Ref" : "VpcId" }
+      }
+    },
+
+    "ServerSecurityGroup" : {
+      "Type" : "AWS::EC2::SecurityGroup",
+      "Properties" : {
+        "GroupDescription" : "Graphite servers",
+        "VpcId" : { "Ref" : "VpcId" },
+        "SecurityGroupIngress" :  [ 
+            { "IpProtocol" : "tcp", "FromPort" : "80", "ToPort" : "80", "SourceSecurityGroupId" : { "Ref" : "PublicLbSecurityGroup"} },
+            { "IpProtocol" : "tcp", "FromPort" : "2003", "ToPort" : "2003", "SourceSecurityGroupId" : { "Ref" : "PublicLbSecurityGroup"} },
+            { "IpProtocol" : "tcp", "FromPort" : "2003", "ToPort" : "2003", "SourceSecurityGroupId" : { "Ref" : "PrivateLbSecurityGroup"} },
+            { "IpProtocol" : "tcp", "FromPort" : "2003", "ToPort" : "2003", "SourceSecurityGroupId" : { "Ref" : "ClientSecurityGroup"} }
+        ]
+      }
+    },
+
+    "PublicElb" : {
+      "Type" : "AWS::ElasticLoadBalancing::LoadBalancer",
+      "Properties" : {
+        "SecurityGroups": [{ "Ref": "PublicLbSecurityGroup" }, { "Ref" : "AdminSecurityGroup" }],
+        "Subnets": { "Ref": "Subnets" },
+        "Listeners" : [
+          {
+            "LoadBalancerPort" : "80",
+            "Protocol" : "HTTP",
+            "InstancePort" : "80",
+            "InstanceProtocol" : "HTTP"
+          },
+          {
+            "LoadBalancerPort" : "2003",
+            "Protocol" : "TCP",
+            "InstancePort" : "2003",
+            "InstanceProtocol" : "TCP"
+          }
+        ],
+        "HealthCheck": {
+          "Target": "HTTP:80/",
+          "HealthyThreshold": "2",
+          "UnhealthyThreshold": "3",
+          "Interval": "30",
+          "Timeout": "5"
+        }
+      }
+    },
+
+    "PrivateElb" : {
+      "Type" : "AWS::ElasticLoadBalancing::LoadBalancer",
+      "Properties" : {
+        "Scheme" : "internal",
+        "SecurityGroups": [{ "Ref": "PrivateLbSecurityGroup" }],
+        "Subnets": { "Ref": "Subnets" },
+        "Listeners" : [
+          {
+            "LoadBalancerPort" : "2003",
+            "Protocol" : "TCP",
+            "InstancePort" : "2003",
+            "InstanceProtocol" : "TCP"
+          }
+        ],
+        "HealthCheck": {
+          "Target": "TCP:2003",
+          "HealthyThreshold": "2",
+          "UnhealthyThreshold": "3",
+          "Interval": "30",
+          "Timeout": "5"
+        }
+      }
+    },
+
+    "WaitHandle" : {
+      "Type" : "AWS::CloudFormation::WaitConditionHandle"
+    }
+  },
+
+  "Outputs" : {
+    "PublicEndpoint" : {
+      "Description" : "Public endpoint",
+      "Value" :  { "Fn::GetAtt" : [ "PublicElb", "DNSName" ] }
+    },
+    "PrivateEndpoint" : {
+      "Description" : "Private endpoint",
+      "Value" :  { "Fn::GetAtt" : [ "PrivateElb", "DNSName" ] }
+    },
+    "ClientSecurityGroup" : {
+      "Value" : { "Ref" : "ClientSecurityGroup" }
+    }
+  }
+}
