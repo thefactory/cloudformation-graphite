@@ -44,10 +44,15 @@
       "Description" : "Latest EBS snapshot of Graphite data volume (e.g., 'snap-1234567b')",
       "Type" : "String"
     },
+    "ElasticsearchDockerImage" : {
+      "Description" : "Path to the Elasticsearch image to use (format: '[<registry>[:<port>]/]<repository>[:<version>]')",
+      "Type" : "String",
+      "Default" : "dockerfile/elasticsearch"
+    },
     "Subnets" : {
       "Description" : "List of VPC subnet IDs for the cluster. Note: must match the passed AvailabilityZones.",
       "Type" : "CommaDelimitedList"
-    },  
+    },
     "VpcId" : {
       "Description" : "VPC associated with the provided subnets",
       "Type" : "String"
@@ -395,8 +400,33 @@
                   "region": { "Ref" : "AWS::Region" },
                   "stack": { "Ref" : "AWS::StackName" },
                   "key": { "Ref" : "HostKeys" }, 
-                  "secret": { "Fn::GetAtt" : ["HostKeys", "SecretAccessKey"]}                  
+                  "secret": { "Fn::GetAtt" : ["HostKeys", "SecretAccessKey"]}
                 },
+                "mode"    : "000644",
+                "owner"   : "root",
+                "group"   : "root"
+              },
+
+              "/var/lib/graphite/elasticsearch/elasticsearch.yml" : {
+                "content" : { "Fn::Join" : ["\n", [
+                  "path:",
+                  "  logs: /data/log",
+                  "  data: /data/data",
+                  ""
+                ]]},
+                "mode"    : "000644",
+                "owner"   : "root",
+                "group"   : "root"
+              },
+
+             "/etc/apache2/sites-available/grafana.conf" : {
+                "content" : { "Fn::Join" : ["\n", [
+                  "Header set Access-Control-Allow-Origin \"*\"",
+                  "Header set Access-Control-Allow-Methods \"GET, OPTIONS\"",
+                  "Header set Access-Control-Allow-Headers \"origin, authorization, accept\"",
+                  "alias /grafana /usr/share/grafana",
+                  ""
+                ]]},
                 "mode"    : "000644",
                 "owner"   : "root",
                 "group"   : "root"
@@ -434,6 +464,10 @@
           "mkdir -p /var/lib/graphite\n",
           "mount /dev/xvdf /var/lib/graphite\n",
 
+          "# Set up grafana and elasticsearch directories\n",
+          "mkdir -p /var/lib/graphite/elasticsearch\n",
+          "mkdir -p /usr/share/grafana\n",
+
           "apt-get update\n",
 
           "cfn-init -s ", { "Ref" : "AWS::StackName" }, " -r LaunchConfig ",
@@ -462,10 +496,63 @@
           "a2dissite 000-default\n",
           "cp /usr/share/graphite-web/apache2-graphite.conf /etc/apache2/sites-available\n",
           "a2ensite apache2-graphite\n",
+          "service apache2 reload\n",
 
           "service carbon-cache start\n",
-          "service apache2 reload\n",
           
+          "# Set up Elasticsearch\n",
+          "docker pull ", { "Ref": "ElasticsearchDockerImage" }, "\n",
+          "runit-service create elasticsearch docker run --rm",
+          "   -p 9200:9200",
+          "   -p 9300:9300",
+          "   -v /var/lib/graphite/elasticsearch:/data",
+          " ", { "Ref" : "ElasticsearchDockerImage"}, " "
+          "    /elasticsearch/bin/elasticsearch",
+          "    -Des.config=/data/elasticsearch.yml",
+          "|| error_exit 'Failed to launch Docker container'\n",
+          "runit-service enable elasticsearch\n",
+
+          "# Set up Grafana\n",
+          "curl -O -L http://grafanarel.s3.amazonaws.com/grafana-1.7.0.tar.gz\n",
+          "tar xzf grafana-1.7.0.tar.gz -C /usr/share/grafana --strip=1\n",
+          "a2ensite grafana\n",
+          "a2enmod headers # For CORS needed by Grafana \n",
+          "service apache2 restart\n",
+
+          "# Must use this server's public hostname because graphite.url needs to be accessible by both this server and the browser\n",
+          "# Consequently, can't do this via via CloudFormation::Init\n",
+          "cat << EOF > /usr/share/grafana/config.js \n",
+          "define(['settings'],\n",
+          "function (Settings) {\n",
+          "  return new Settings({\n",
+          "    datasources: {\n",
+          "      graphite: {\n",
+          "        type: 'graphite',\n",
+          "        url: 'http://`ec2metadata --public-hostname`',\n",
+          "      },\n",
+          "      elasticsearch: {\n",
+          "        type: 'elasticsearch',\n",
+          "        url: 'http://`ec2metadata --public-hostname`:9200',\n",
+          "        index: 'grafana-dash',\n",
+          "        grafanaDB: true,\n",
+          "      }\n",
+          "    },\n",
+          "    search: {\n",
+          "      max_results: 20\n",
+          "    },\n",
+          "    default_route: '/dashboard/file/default.json',\n",
+          "    unsaved_changes_warning: true,\n",
+          "    playlist_timespan: '1m',\n",
+          "    admin: {\n",
+          "      password: ''\n",
+          "    },\n",
+          "    plugins: {\n",
+          "      panels: []\n",
+          "    }\n",
+          "  });\n",
+          "});\n",
+          "EOF\n",
+
           "# All is well so signal success\n",
           "cfn-signal -e 0 -r \"Stack setup complete\" '", { "Ref" : "WaitHandle" }, "'\n",
 
@@ -533,6 +620,12 @@
             "Protocol" : "TCP",
             "InstancePort" : "2003",
             "InstanceProtocol" : "TCP"
+          },
+          {
+            "LoadBalancerPort" : "9200",
+            "Protocol" : "HTTP",
+            "InstancePort" : "9200",
+            "InstanceProtocol" : "HTTP"
           }
         ],
         "HealthCheck": {

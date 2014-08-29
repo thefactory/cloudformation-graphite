@@ -1,14 +1,14 @@
-CloudFormation template for a persistent, self-healing [Graphite](http://graphite.wikidot.com/) stack.
+CloudFormation template for a persistent, self-healing [Graphite](http://graphite.wikidot.com/)+[Grafana](http://grafana.org/) stack.
 
 ## Overview
 
-This template bootstraps a Graphite stack with fixed public and private endpoints.
+This template bootstraps a Graphite stack with fixed public and private endpoints and pre-loaded with Elasticsearch and Grafana.
 
 ![architecture](https://raw.githubusercontent.com/thefactory/cloudformation-graphite/master/stack_architecture.png)
 
 The public endpoint is accessible via the injected admin security group. The private endpoint is accessible by servers associated with the generated client security group.
 
-The stack runs a single server within an auto-scaling group. Metric data is stored in an attached EBS volume that the server snapshots hourly (and trims all but the newest five).
+The stack runs a single server within an auto-scaling group. Metric and dashboard data is stored in an attached EBS volume that the server snapshots hourly (and trims all but the newest five).
 
 If the server is terminated, the auto-scaling group will launch a replacement with an EBS volume created from the latest snapshot. The replacement server will automatically register with both ELBs.
 
@@ -60,7 +60,7 @@ aws cloudformation create-stack \
         ParameterKey=AdminSecurityGroup,ParameterValue=<sg_id>
 ```
 
-### 5. Test Graphite
+### 5. Test Graphite and Grafana
 Once the stack has been provisioned, try hitting the Graphite web UI at `http://<public_endpoint>/`. You will need to do this from a location granted access by the specified `AdminSecurityGroup`.
 
 Next, associate `ClientSecurityGroup` with one of your instances and (from that instance) try sending some data to the private endpoint:
@@ -69,3 +69,5 @@ $ echo "mytest $RANDOM `date +%s`"|nc <private_endpoint> 2003
 ```
 
 If you refresh the web UI, you should see the `mytest` series under the `Graphite` folder.
+
+Finally, try loading Grafana at `http://<public_endpoint>/grafana`. You should see the default dashboard with a chart of randomly-generated Graphite data.
