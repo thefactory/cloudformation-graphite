@@ -506,7 +506,7 @@
           "   -p 9200:9200",
           "   -p 9300:9300",
           "   -v /var/lib/graphite/elasticsearch:/data",
-          " ", { "Ref" : "ElasticsearchDockerImage"}, " "
+          " ", { "Ref" : "ElasticsearchDockerImage"}, " ",
           "    /elasticsearch/bin/elasticsearch",
           "    -Des.config=/data/elasticsearch.yml",
           "|| error_exit 'Failed to launch Docker container'\n",
