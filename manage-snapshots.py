@@ -34,7 +34,7 @@ class SnapshotManager(object):
         self.cfn_conn.update_stack(self.stack, template_body=template, parameters=params, capabilities=['CAPABILITY_IAM'])
     
     def trim_snapshots(self, keep=5):
-        for snapshot in self.get_completed_snapshots()[:keep-1]:
+        for snapshot in self.get_completed_snapshots()[:-keep]:
             print 'Deleting snapshot {snap}'.format(snap=snapshot.id)
             self.ec2_conn.delete_snapshot(snapshot.id)
 
